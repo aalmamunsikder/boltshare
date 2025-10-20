@@ -93,6 +93,37 @@ export function RoomPage() {
     return Math.round(bytes / Math.pow(k, i) * 100) / 100 + ' ' + sizes[i];
   };
 
+  const handleDownload = (transfer: any) => {
+    if (!transfer.data) {
+      console.error('File data not available for download');
+      return;
+    }
+
+    try {
+      // Create a blob from the file data
+      const blob = new Blob([transfer.data]);
+      const url = URL.createObjectURL(blob);
+      
+      // Create a temporary download link
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = transfer.name;
+      link.style.display = 'none';
+      
+      // Add to DOM, click, and remove
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      
+      // Clean up the object URL
+      URL.revokeObjectURL(url);
+      
+      console.log(`Successfully downloaded ${transfer.name}`);
+    } catch (error) {
+      console.error('Error downloading file:', error);
+    }
+  };
+
   return (
     <div className="h-screen flex flex-col bg-gradient-to-br from-slate-50 via-blue-50 to-indigo-100 relative overflow-hidden">
       {/* Animated background elements */}
@@ -226,10 +257,20 @@ export function RoomPage() {
                             </div>
                           </div>
                           <div className="flex items-center space-x-3">
-                            {transfer.status === 'completed' && (
-                              <button className="p-3 bg-gradient-to-br from-green-100 to-emerald-100 text-green-600 rounded-xl hover:from-green-200 hover:to-emerald-200 transition-all duration-200 hover:scale-110">
+                            {transfer.status === 'completed' && transfer.fromUserId !== user!.id && (
+                              <button 
+                                onClick={() => handleDownload(transfer)}
+                                className="p-3 bg-gradient-to-br from-green-100 to-emerald-100 text-green-600 rounded-xl hover:from-green-200 hover:to-emerald-200 transition-all duration-200 hover:scale-110"
+                                title="Download file"
+                              >
                                 <Download className="w-6 h-6" />
                               </button>
+                            )}
+                            {transfer.status === 'completed' && transfer.fromUserId === user!.id && (
+                              <div className="flex items-center space-x-2 px-3 py-2 bg-blue-100 text-blue-600 rounded-xl">
+                                <div className="w-2 h-2 bg-green-500 rounded-full"></div>
+                                <span className="text-sm font-medium">Sent</span>
+                              </div>
                             )}
                             {transfer.status === 'transferring' && (
                               <div className="text-lg font-semibold text-blue-600">

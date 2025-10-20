@@ -17,6 +17,8 @@ export interface FileTransfer {
   status: 'pending' | 'transferring' | 'completed' | 'failed';
   fromUserId: string;
   fromUsername: string;
+  data?: ArrayBuffer; // Store the file data for downloading
+  chunks?: ArrayBuffer[]; // Store file chunks for reassembly
 }
 
 export interface Peer {
@@ -77,6 +79,50 @@ export function useWebRTC(roomId: string, userId: string, username: string) {
             fromUserId: data.fromUserId,
             fromUsername: data.fromUsername,
           }]);
+        } else if (data.type === 'file-data') {
+          setFileTransfers((prev) =>
+            prev.map((ft) =>
+              ft.id === data.id
+                ? { ...ft, data: data.data, status: 'completed', progress: 100 }
+                : ft
+            )
+          );
+        } else if (data.type === 'file-chunk') {
+          // Handle file chunks for reassembly
+          setFileTransfers((prev) =>
+            prev.map((ft) => {
+              if (ft.id === data.id) {
+                // Initialize chunks array if not exists
+                if (!ft.chunks) {
+                  ft.chunks = new Array(data.totalChunks);
+                }
+                
+                // Store the chunk
+                ft.chunks[data.chunkIndex] = data.data;
+                
+                // Check if all chunks received
+                const receivedChunks = ft.chunks.filter(chunk => chunk !== undefined).length;
+                const progress = Math.round((receivedChunks / data.totalChunks) * 100);
+                
+                if (receivedChunks === data.totalChunks) {
+                  // Reassemble the file
+                  const totalLength = ft.chunks.reduce((sum, chunk) => sum + chunk.byteLength, 0);
+                  const reassembled = new Uint8Array(totalLength);
+                  let offset = 0;
+                  
+                  for (const chunk of ft.chunks) {
+                    reassembled.set(new Uint8Array(chunk), offset);
+                    offset += chunk.byteLength;
+                  }
+                  
+                  return { ...ft, data: reassembled.buffer, status: 'completed', progress: 100 };
+                } else {
+                  return { ...ft, progress };
+                }
+              }
+              return ft;
+            })
+          );
         }
       } catch (error) {
         console.error('Error parsing message:', error);
@@ -209,11 +255,45 @@ export function useWebRTC(roomId: string, userId: string, username: string) {
 
     const reader = new FileReader();
     reader.onload = () => {
+      const arrayBuffer = reader.result as ArrayBuffer;
+      
+      // Update local transfer with data
       setFileTransfers((prev) =>
         prev.map((ft) =>
-          ft.id === fileId ? { ...ft, status: 'completed', progress: 100 } : ft
+          ft.id === fileId ? { ...ft, data: arrayBuffer, status: 'completed', progress: 100 } : ft
         )
       );
+
+      // Send file data to peers
+      const fileData = {
+        type: 'file-data',
+        id: fileId,
+        data: arrayBuffer,
+      };
+
+      peersRef.current.forEach((peer) => {
+        if (peer.dataChannel && peer.dataChannel.readyState === 'open') {
+          // Send in chunks to avoid message size limits
+          const chunkSize = 16384; // 16KB chunks
+          const totalChunks = Math.ceil(arrayBuffer.byteLength / chunkSize);
+          
+          for (let i = 0; i < totalChunks; i++) {
+            const start = i * chunkSize;
+            const end = Math.min(start + chunkSize, arrayBuffer.byteLength);
+            const chunk = arrayBuffer.slice(start, end);
+            
+            const chunkData = {
+              type: 'file-chunk',
+              id: fileId,
+              chunkIndex: i,
+              totalChunks,
+              data: chunk,
+            };
+            
+            peer.dataChannel.send(JSON.stringify(chunkData));
+          }
+        }
+      });
     };
     reader.readAsArrayBuffer(file);
   }, [userId, username]);
