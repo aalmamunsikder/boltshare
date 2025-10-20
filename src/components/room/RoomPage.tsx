@@ -96,6 +96,7 @@ export function RoomPage() {
   const handleDownload = (transfer: any) => {
     if (!transfer.data) {
       console.error('File data not available for download');
+      alert('File data is not ready yet. Please wait for the transfer to complete.');
       return;
     }
 
@@ -118,9 +119,10 @@ export function RoomPage() {
       // Clean up the object URL
       URL.revokeObjectURL(url);
       
-      console.log(`Successfully downloaded ${transfer.name}`);
+      console.log(`Successfully downloaded ${transfer.name} (${blob.size} bytes)`);
     } catch (error) {
       console.error('Error downloading file:', error);
+      alert('Failed to download file. Please try again.');
     }
   };
 

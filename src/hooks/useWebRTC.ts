@@ -82,6 +82,62 @@ export function useWebRTC(roomId: string, userId: string, username: string) {
 
     channel.onmessage = (event) => {
       try {
+        // Check if it's binary data (file chunk)
+        if (event.data instanceof ArrayBuffer) {
+          const buffer = new Uint8Array(event.data);
+          const headerView = new DataView(event.data, 0, 16);
+          
+          const fileIdLength = headerView.getUint32(0, false);
+          const chunkIndex = headerView.getUint32(4, false);
+          const totalChunks = headerView.getUint32(8, false);
+          const chunkSize = headerView.getUint32(12, false);
+          
+          // Extract file ID and chunk data
+          const fileId = new TextDecoder().decode(buffer.slice(16, 16 + fileIdLength));
+          const chunkData = buffer.slice(16 + fileIdLength, 16 + fileIdLength + chunkSize);
+          
+          console.log(`Received chunk ${chunkIndex + 1}/${totalChunks} for file ${fileId}`);
+          
+          // Handle file chunks for reassembly
+          setFileTransfers((prev) =>
+            prev.map((ft) => {
+              if (ft.id === fileId) {
+                // Initialize chunks array if not exists
+                if (!ft.chunks) {
+                  ft.chunks = new Array(totalChunks);
+                }
+                
+                // Store the chunk
+                ft.chunks[chunkIndex] = chunkData.buffer;
+                
+                // Check if all chunks received
+                const receivedChunks = ft.chunks.filter(chunk => chunk !== undefined).length;
+                const progress = Math.round((receivedChunks / totalChunks) * 100);
+                
+                console.log(`File ${fileId}: ${receivedChunks}/${totalChunks} chunks received (${progress}%)`);
+                
+                if (receivedChunks === totalChunks) {
+                  // Reassemble the file
+                  const totalLength = ft.chunks.reduce((sum, chunk) => sum + chunk.byteLength, 0);
+                  const reassembled = new Uint8Array(totalLength);
+                  let offset = 0;
+                  
+                  for (const chunk of ft.chunks) {
+                    reassembled.set(new Uint8Array(chunk), offset);
+                    offset += chunk.byteLength;
+                  }
+                  
+                  console.log(`File ${fileId} reassembled successfully, size: ${reassembled.length} bytes`);
+                  return { ...ft, data: reassembled.buffer, status: 'completed', progress: 100 };
+                } else {
+                  return { ...ft, progress };
+                }
+              }
+              return ft;
+            })
+          );
+        } else {
+          // Handle JSON messages
         const data = JSON.parse(event.data);
 
         if (data.type === 'chat') {
@@ -102,50 +158,16 @@ export function useWebRTC(roomId: string, userId: string, username: string) {
             fromUserId: data.fromUserId,
             fromUsername: data.fromUsername,
           }]);
-        } else if (data.type === 'file-data') {
-          setFileTransfers((prev) =>
-            prev.map((ft) =>
-              ft.id === data.id
-                ? { ...ft, data: data.data, status: 'completed', progress: 100 }
-                : ft
-            )
-          );
-        } else if (data.type === 'file-chunk') {
-          // Handle file chunks for reassembly
-          setFileTransfers((prev) =>
-            prev.map((ft) => {
-              if (ft.id === data.id) {
-                // Initialize chunks array if not exists
-                if (!ft.chunks) {
-                  ft.chunks = new Array(data.totalChunks);
-                }
-                
-                // Store the chunk
-                ft.chunks[data.chunkIndex] = data.data;
-                
-                // Check if all chunks received
-                const receivedChunks = ft.chunks.filter(chunk => chunk !== undefined).length;
-                const progress = Math.round((receivedChunks / data.totalChunks) * 100);
-                
-                if (receivedChunks === data.totalChunks) {
-                  // Reassemble the file
-                  const totalLength = ft.chunks.reduce((sum, chunk) => sum + chunk.byteLength, 0);
-                  const reassembled = new Uint8Array(totalLength);
-                  let offset = 0;
-                  
-                  for (const chunk of ft.chunks) {
-                    reassembled.set(new Uint8Array(chunk), offset);
-                    offset += chunk.byteLength;
-                  }
-                  
-                  return { ...ft, data: reassembled.buffer, status: 'completed', progress: 100 };
-                } else {
-                  return { ...ft, progress };
-                }
-              }
-              return ft;
-            })
-          );
+          } else if (data.type === 'file-metadata') {
+            console.log(`Received file metadata for ${data.name}: ${data.totalChunks} chunks`);
+            setFileTransfers((prev) =>
+              prev.map((ft) =>
+                ft.id === data.id
+                  ? { ...ft, chunks: new Array(data.totalChunks), progress: 0 }
+                  : ft
+              )
+            );
+          }
         }
       } catch (error) {
         console.error('Error parsing message:', error);
@@ -206,7 +228,11 @@ export function useWebRTC(roomId: string, userId: string, username: string) {
     };
 
     if (isInitiator) {
-      const dataChannel = pc.createDataChannel('fileTransfer');
+      const dataChannel = pc.createDataChannel('fileTransfer', {
+        ordered: true,
+        maxRetransmits: 3,
+      });
+      dataChannel.binaryType = 'arraybuffer';
       setupDataChannel(dataChannel, peerId);
 
       setPeers((prev) => {
@@ -222,6 +248,7 @@ export function useWebRTC(roomId: string, userId: string, username: string) {
     } else {
       pc.ondatachannel = (event) => {
         const dataChannel = event.channel;
+        dataChannel.binaryType = 'arraybuffer';
         setupDataChannel(dataChannel, peerId);
 
         setPeers((prev) => {
@@ -311,33 +338,49 @@ export function useWebRTC(roomId: string, userId: string, username: string) {
         )
       );
 
-      // Send file data to peers
-      const fileData = {
-        type: 'file-data',
-        id: fileId,
-        data: arrayBuffer,
-      };
-
+      // Send file data to peers in binary chunks
       peersRef.current.forEach((peer) => {
         if (peer.dataChannel && peer.dataChannel.readyState === 'open') {
-          // Send in chunks to avoid message size limits
           const chunkSize = 16384; // 16KB chunks
           const totalChunks = Math.ceil(arrayBuffer.byteLength / chunkSize);
           
+          console.log(`Sending file ${file.name} in ${totalChunks} chunks`);
+          
+          // Send file metadata first
+          const metadata = {
+            type: 'file-metadata',
+            id: fileId,
+            name: file.name,
+            size: file.size,
+            totalChunks,
+          };
+          peer.dataChannel.send(JSON.stringify(metadata));
+          
+          // Send file chunks as binary data
           for (let i = 0; i < totalChunks; i++) {
             const start = i * chunkSize;
             const end = Math.min(start + chunkSize, arrayBuffer.byteLength);
             const chunk = arrayBuffer.slice(start, end);
             
-            const chunkData = {
-              type: 'file-chunk',
-              id: fileId,
-              chunkIndex: i,
-              totalChunks,
-              data: chunk,
-            };
+            // Create a message with chunk info and binary data
+            const chunkHeader = new ArrayBuffer(16); // 16 bytes for header
+            const headerView = new DataView(chunkHeader);
+            headerView.setUint32(0, fileId.length, false); // Length of file ID
+            headerView.setUint32(4, i, false); // Chunk index
+            headerView.setUint32(8, totalChunks, false); // Total chunks
+            headerView.setUint32(12, chunk.byteLength, false); // Chunk size
             
-            peer.dataChannel.send(JSON.stringify(chunkData));
+            // Combine header and chunk data
+            const combinedBuffer = new Uint8Array(16 + fileId.length + chunk.byteLength);
+            combinedBuffer.set(new Uint8Array(chunkHeader), 0);
+            combinedBuffer.set(new TextEncoder().encode(fileId), 16);
+            combinedBuffer.set(new Uint8Array(chunk), 16 + fileId.length);
+            
+            try {
+              peer.dataChannel.send(combinedBuffer);
+            } catch (error) {
+              console.error('Error sending file chunk:', error);
+            }
           }
         }
       });
@@ -429,7 +472,7 @@ export function useWebRTC(roomId: string, userId: string, username: string) {
           const pc = peer?.connection || createPeerConnection(payload.from, false);
             signalingStatesRef.current.set(payload.from, 'answer');
 
-            pc.setRemoteDescription(new RTCSessionDescription(payload.offer))
+          pc.setRemoteDescription(new RTCSessionDescription(payload.offer))
               .then(() => {
                 // Process any buffered ICE candidates
                 processBufferedIceCandidates(payload.from, pc);
@@ -447,17 +490,17 @@ export function useWebRTC(roomId: string, userId: string, username: string) {
                 }
                 return Promise.resolve();
               })
-              .then(() => {
+            .then(() => {
                 if (pc.localDescription) {
-                  channel.send({
-                    type: 'broadcast',
-                    payload: {
-                      type: 'answer',
-                      answer: pc.localDescription,
-                      from: userId,
-                      to: payload.from,
-                    },
-                  });
+              channel.send({
+                type: 'broadcast',
+                payload: {
+                  type: 'answer',
+                  answer: pc.localDescription,
+                  from: userId,
+                  to: payload.from,
+                },
+              });
                   signalingStatesRef.current.set(payload.from, 'connected');
                 }
               })
