@@ -42,6 +42,7 @@ export function useWebRTC(roomId: string, userId: string, username: string) {
   const [connected, setConnected] = useState(false);
   const channelRef = useRef<any>(null);
   const peersRef = useRef<Map<string, Peer>>(new Map());
+  const signalingStatesRef = useRef<Map<string, 'idle' | 'offer' | 'answer' | 'connected'>>(new Map());
 
   useEffect(() => {
     peersRef.current = peers;
@@ -315,21 +316,45 @@ export function useWebRTC(roomId: string, userId: string, username: string) {
 
         const newUserId = newPresences[0]?.user_id;
         if (newUserId && newUserId !== userId && !peersRef.current.has(newUserId)) {
-          const pc = createPeerConnection(newUserId, true);
+          // Use user ID comparison to determine who should initiate the connection
+          // The user with the "smaller" ID (lexicographically) will be the initiator
+          const shouldInitiate = userId < newUserId;
+          
+          if (shouldInitiate) {
+            console.log(`Initiating connection to ${newUserId}`);
+            const pc = createPeerConnection(newUserId, true);
+            signalingStatesRef.current.set(newUserId, 'offer');
 
-          pc.createOffer()
-            .then((offer) => pc.setLocalDescription(offer))
-            .then(() => {
-              channel.send({
-                type: 'broadcast',
-                payload: {
-                  type: 'offer',
-                  offer: pc.localDescription,
-                  from: userId,
-                  to: newUserId,
-                },
+            pc.createOffer()
+              .then((offer) => {
+                if (pc.signalingState === 'stable') {
+                  return pc.setLocalDescription(offer);
+                } else {
+                  console.log('Connection state not stable, skipping offer');
+                  return Promise.resolve();
+                }
+              })
+              .then(() => {
+                if (pc.localDescription) {
+                  channel.send({
+                    type: 'broadcast',
+                    payload: {
+                      type: 'offer',
+                      offer: pc.localDescription,
+                      from: userId,
+                      to: newUserId,
+                    },
+                  });
+                }
+              })
+              .catch((error) => {
+                console.error('Error creating offer:', error);
+                signalingStatesRef.current.delete(newUserId);
               });
-            });
+          } else {
+            console.log(`Waiting for offer from ${newUserId}`);
+            signalingStatesRef.current.set(newUserId, 'idle');
+          }
         }
       })
       .on('presence', { event: 'leave' }, ({ key }) => {
@@ -343,6 +368,8 @@ export function useWebRTC(roomId: string, userId: string, username: string) {
           }
           return newPeers;
         });
+        // Clean up signaling state
+        signalingStatesRef.current.delete(key);
       })
       .on('broadcast', { event: '*' }, ({ payload }: any) => {
         if (payload.to !== userId) return;
@@ -350,26 +377,71 @@ export function useWebRTC(roomId: string, userId: string, username: string) {
         const peer = peersRef.current.get(payload.from);
 
         if (payload.type === 'offer') {
-          const pc = peer?.connection || createPeerConnection(payload.from, false);
+          const currentState = signalingStatesRef.current.get(payload.from);
+          if (currentState === 'idle' || !currentState) {
+            console.log(`Received offer from ${payload.from}`);
+            const pc = peer?.connection || createPeerConnection(payload.from, false);
+            signalingStatesRef.current.set(payload.from, 'answer');
 
-          pc.setRemoteDescription(new RTCSessionDescription(payload.offer))
-            .then(() => pc.createAnswer())
-            .then((answer) => pc.setLocalDescription(answer))
-            .then(() => {
-              channel.send({
-                type: 'broadcast',
-                payload: {
-                  type: 'answer',
-                  answer: pc.localDescription,
-                  from: userId,
-                  to: payload.from,
-                },
+            pc.setRemoteDescription(new RTCSessionDescription(payload.offer))
+              .then(() => {
+                if (pc.signalingState === 'have-remote-offer') {
+                  return pc.createAnswer();
+                } else {
+                  console.log('Not in correct state for answer, current state:', pc.signalingState);
+                  return Promise.resolve();
+                }
+              })
+              .then((answer) => {
+                if (answer) {
+                  return pc.setLocalDescription(answer);
+                }
+                return Promise.resolve();
+              })
+              .then(() => {
+                if (pc.localDescription) {
+                  channel.send({
+                    type: 'broadcast',
+                    payload: {
+                      type: 'answer',
+                      answer: pc.localDescription,
+                      from: userId,
+                      to: payload.from,
+                    },
+                  });
+                  signalingStatesRef.current.set(payload.from, 'connected');
+                }
+              })
+              .catch((error) => {
+                console.error('Error handling offer:', error);
+                signalingStatesRef.current.delete(payload.from);
               });
-            });
+          } else {
+            console.log(`Ignoring offer from ${payload.from}, current state: ${currentState}`);
+          }
         } else if (payload.type === 'answer') {
-          peer?.connection.setRemoteDescription(new RTCSessionDescription(payload.answer));
+          const currentState = signalingStatesRef.current.get(payload.from);
+          if (currentState === 'offer') {
+            console.log(`Received answer from ${payload.from}`);
+            peer?.connection.setRemoteDescription(new RTCSessionDescription(payload.answer))
+              .then(() => {
+                signalingStatesRef.current.set(payload.from, 'connected');
+              })
+              .catch((error) => {
+                console.error('Error handling answer:', error);
+                signalingStatesRef.current.delete(payload.from);
+              });
+          } else {
+            console.log(`Ignoring answer from ${payload.from}, current state: ${currentState}`);
+          }
         } else if (payload.type === 'ice-candidate') {
-          peer?.connection.addIceCandidate(new RTCIceCandidate(payload.candidate));
+          const currentState = signalingStatesRef.current.get(payload.from);
+          if (currentState && peer?.connection) {
+            peer.connection.addIceCandidate(new RTCIceCandidate(payload.candidate))
+              .catch((error) => {
+                console.error('Error adding ICE candidate:', error);
+              });
+          }
         }
       })
       .subscribe((status) => {
@@ -386,6 +458,7 @@ export function useWebRTC(roomId: string, userId: string, username: string) {
       peersRef.current.forEach((peer) => {
         peer.connection.close();
       });
+      signalingStatesRef.current.clear();
       channel.unsubscribe();
     };
   }, [roomId, userId, username, createPeerConnection]);
