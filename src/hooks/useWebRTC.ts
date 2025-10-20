@@ -32,7 +32,11 @@ const ICE_SERVERS = {
   iceServers: [
     { urls: 'stun:stun.l.google.com:19302' },
     { urls: 'stun:stun1.l.google.com:19302' },
+    { urls: 'stun:stun2.l.google.com:19302' },
+    { urls: 'stun:stun3.l.google.com:19302' },
+    { urls: 'stun:stun4.l.google.com:19302' },
   ],
+  iceCandidatePoolSize: 10,
 };
 
 export function useWebRTC(roomId: string, userId: string, username: string) {
@@ -43,10 +47,28 @@ export function useWebRTC(roomId: string, userId: string, username: string) {
   const channelRef = useRef<any>(null);
   const peersRef = useRef<Map<string, Peer>>(new Map());
   const signalingStatesRef = useRef<Map<string, 'idle' | 'offer' | 'answer' | 'connected'>>(new Map());
+  const iceCandidatesRef = useRef<Map<string, RTCIceCandidate[]>>(new Map());
 
   useEffect(() => {
     peersRef.current = peers;
   }, [peers]);
+
+  const processBufferedIceCandidates = useCallback((peerId: string, pc: RTCPeerConnection) => {
+    const bufferedCandidates = iceCandidatesRef.current.get(peerId);
+    if (bufferedCandidates && bufferedCandidates.length > 0) {
+      console.log(`Processing ${bufferedCandidates.length} buffered ICE candidates for ${peerId}`);
+      bufferedCandidates.forEach((candidate) => {
+        pc.addIceCandidate(candidate)
+          .then(() => {
+            console.log(`Successfully added buffered ICE candidate for ${peerId}`);
+          })
+          .catch((error) => {
+            console.error(`Failed to add buffered ICE candidate for ${peerId}:`, error);
+          });
+      });
+      iceCandidatesRef.current.delete(peerId);
+    }
+  }, []);
 
   const setupDataChannel = useCallback((channel: RTCDataChannel, peerId: string) => {
     channel.onopen = () => {
@@ -136,6 +158,7 @@ export function useWebRTC(roomId: string, userId: string, username: string) {
 
     pc.onicecandidate = (event) => {
       if (event.candidate && channelRef.current) {
+        console.log(`Sending ICE candidate to ${peerId}:`, event.candidate.type);
         channelRef.current.send({
           type: 'broadcast',
           payload: {
@@ -145,17 +168,40 @@ export function useWebRTC(roomId: string, userId: string, username: string) {
             to: peerId,
           },
         });
+      } else if (!event.candidate) {
+        console.log(`ICE gathering complete for ${peerId}`);
       }
+    };
+
+    pc.onicegatheringstatechange = () => {
+      console.log(`ICE gathering state for ${peerId}: ${pc.iceGatheringState}`);
+    };
+
+    pc.oniceconnectionstatechange = () => {
+      console.log(`ICE connection state for ${peerId}: ${pc.iceConnectionState}`);
     };
 
     pc.onconnectionstatechange = () => {
       console.log(`Connection state with ${peerId}: ${pc.connectionState}`);
-      if (pc.connectionState === 'failed' || pc.connectionState === 'disconnected') {
+      if (pc.connectionState === 'connected') {
+        setConnected(true);
+        signalingStatesRef.current.set(peerId, 'connected');
+      } else if (pc.connectionState === 'failed') {
+        console.log(`Connection failed with ${peerId}, attempting restart...`);
+        // Attempt to restart the connection
+        setTimeout(() => {
+          if (pc.connectionState === 'failed') {
+            pc.restartIce();
+          }
+        }, 1000);
+      } else if (pc.connectionState === 'disconnected' || pc.connectionState === 'closed') {
         setPeers((prev) => {
           const newPeers = new Map(prev);
           newPeers.delete(peerId);
           return newPeers;
         });
+        signalingStatesRef.current.delete(peerId);
+        iceCandidatesRef.current.delete(peerId);
       }
     };
 
@@ -322,10 +368,10 @@ export function useWebRTC(roomId: string, userId: string, username: string) {
           
           if (shouldInitiate) {
             console.log(`Initiating connection to ${newUserId}`);
-            const pc = createPeerConnection(newUserId, true);
+          const pc = createPeerConnection(newUserId, true);
             signalingStatesRef.current.set(newUserId, 'offer');
 
-            pc.createOffer()
+          pc.createOffer()
               .then((offer) => {
                 if (pc.signalingState === 'stable') {
                   return pc.setLocalDescription(offer);
@@ -334,23 +380,23 @@ export function useWebRTC(roomId: string, userId: string, username: string) {
                   return Promise.resolve();
                 }
               })
-              .then(() => {
+            .then(() => {
                 if (pc.localDescription) {
-                  channel.send({
-                    type: 'broadcast',
-                    payload: {
-                      type: 'offer',
-                      offer: pc.localDescription,
-                      from: userId,
-                      to: newUserId,
-                    },
-                  });
+              channel.send({
+                type: 'broadcast',
+                payload: {
+                  type: 'offer',
+                  offer: pc.localDescription,
+                  from: userId,
+                  to: newUserId,
+                },
+              });
                 }
               })
               .catch((error) => {
                 console.error('Error creating offer:', error);
                 signalingStatesRef.current.delete(newUserId);
-              });
+            });
           } else {
             console.log(`Waiting for offer from ${newUserId}`);
             signalingStatesRef.current.set(newUserId, 'idle');
@@ -380,11 +426,14 @@ export function useWebRTC(roomId: string, userId: string, username: string) {
           const currentState = signalingStatesRef.current.get(payload.from);
           if (currentState === 'idle' || !currentState) {
             console.log(`Received offer from ${payload.from}`);
-            const pc = peer?.connection || createPeerConnection(payload.from, false);
+          const pc = peer?.connection || createPeerConnection(payload.from, false);
             signalingStatesRef.current.set(payload.from, 'answer');
 
             pc.setRemoteDescription(new RTCSessionDescription(payload.offer))
               .then(() => {
+                // Process any buffered ICE candidates
+                processBufferedIceCandidates(payload.from, pc);
+                
                 if (pc.signalingState === 'have-remote-offer') {
                   return pc.createAnswer();
                 } else {
@@ -425,6 +474,8 @@ export function useWebRTC(roomId: string, userId: string, username: string) {
             console.log(`Received answer from ${payload.from}`);
             peer?.connection.setRemoteDescription(new RTCSessionDescription(payload.answer))
               .then(() => {
+                // Process any buffered ICE candidates
+                processBufferedIceCandidates(payload.from, peer.connection);
                 signalingStatesRef.current.set(payload.from, 'connected');
               })
               .catch((error) => {
@@ -437,10 +488,28 @@ export function useWebRTC(roomId: string, userId: string, username: string) {
         } else if (payload.type === 'ice-candidate') {
           const currentState = signalingStatesRef.current.get(payload.from);
           if (currentState && peer?.connection) {
+            console.log(`Received ICE candidate from ${payload.from}:`, payload.candidate.type);
+            
+            // Try to add the ICE candidate immediately
             peer.connection.addIceCandidate(new RTCIceCandidate(payload.candidate))
+              .then(() => {
+                console.log(`Successfully added ICE candidate from ${payload.from}`);
+              })
               .catch((error) => {
-                console.error('Error adding ICE candidate:', error);
+                console.log(`Failed to add ICE candidate immediately, buffering:`, error);
+                // Buffer the candidate if it can't be added immediately
+                if (!iceCandidatesRef.current.has(payload.from)) {
+                  iceCandidatesRef.current.set(payload.from, []);
+                }
+                iceCandidatesRef.current.get(payload.from)!.push(new RTCIceCandidate(payload.candidate));
               });
+          } else {
+            console.log(`Buffering ICE candidate from ${payload.from}, no active connection`);
+            // Buffer the candidate for later
+            if (!iceCandidatesRef.current.has(payload.from)) {
+              iceCandidatesRef.current.set(payload.from, []);
+            }
+            iceCandidatesRef.current.get(payload.from)!.push(new RTCIceCandidate(payload.candidate));
           }
         }
       })
@@ -459,6 +528,7 @@ export function useWebRTC(roomId: string, userId: string, username: string) {
         peer.connection.close();
       });
       signalingStatesRef.current.clear();
+      iceCandidatesRef.current.clear();
       channel.unsubscribe();
     };
   }, [roomId, userId, username, createPeerConnection]);
